@@ -13,7 +13,7 @@ from .models import ScoreResult, Vacancy
 from .notify.telegram import Telegram, TelegramError, format_digest, format_vacancy
 from .pipeline.dedup import dedup_key
 from .pipeline.rules import Rules
-from .pipeline.scorer import Scorer
+from .pipeline.scorer import RateLimited, Scorer
 from .pipeline.title_match import TitleMatcher
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class RunReport:
     duplicates: int = 0
     scored: int = 0
     errors: int = 0
+    rate_limited: bool = False
     sent_apply: int = 0
     sent_maybe: int = 0
     feedback: int = 0
@@ -150,6 +151,11 @@ class Runner:
             v = row_to_vacancy(row)
             try:
                 result = self.scorer.score(v)
+            except RateLimited as e:
+                # free-tier quota: not the vacancy's fault, keep it pending for the next run
+                log.warning("%s – stopping scoring for this run", e)
+                report.rate_limited = True
+                break
             except Exception as e:
                 log.error("scoring #%s failed: %s", row["id"], e)
                 self.db.set_status(row["id"], "error", f"attempt {attempts + 1}: {e}"[:500])

@@ -16,7 +16,14 @@ from .db import DB, row_to_vacancy
 from .http import PoliteClient
 from .notify.telegram import Telegram, format_vacancy
 from .pipeline.rules import Rules
-from .pipeline.scorer import DEFAULT_MODEL, HeuristicScorer, LLMScorer
+from .models import Vacancy
+from .pipeline.scorer import (
+    DEFAULT_MODEL,
+    GeminiScorer,
+    HeuristicScorer,
+    LLMScorer,
+    OllamaScorer,
+)
 from .pipeline.title_match import TitleMatcher
 from .runner import Runner, process_feedback
 
@@ -46,21 +53,55 @@ def build_collectors(s: Settings, only: set[str] | None, http: PoliteClient) -> 
     return out
 
 
+def resolve_provider(s: Settings, no_llm: bool = False) -> str:
+    """auto: Gemini key -> Gemini (free tier); Anthropic key -> Claude; otherwise heuristic."""
+    if no_llm:
+        return "heuristic"
+    provider = str(s.section("scoring").get("provider", "auto")).lower()
+    if provider != "auto":
+        return provider
+    if s.gemini_api_key:
+        return "gemini"
+    if s.anthropic_key_present:
+        return "claude"
+    return "heuristic"
+
+
 def build_scorer(s: Settings, db: DB, no_llm: bool):
     sc = s.section("scoring")
     thresholds = sc.get("thresholds") or {"apply": 80, "maybe": 55}
-    if no_llm or not s.anthropic_key_present:
-        if not no_llm:
-            log.warning("ANTHROPIC_API_KEY not set – using the heuristic scorer")
-        return HeuristicScorer(s.profile, thresholds)
+    provider = resolve_provider(s, no_llm)
     examples = [dict(r) for r in db.feedback_examples(int(sc.get("feedback_examples", 6)))]
-    return LLMScorer(
-        s.profile,
-        model=sc.get("model", DEFAULT_MODEL),
-        effort=sc.get("effort", "medium"),
-        thresholds=thresholds,
-        feedback_examples=examples,
-    )
+
+    if provider == "gemini":
+        if not s.gemini_api_key:
+            sys.exit("scoring.provider is gemini but GEMINI_API_KEY is not set in .env")
+        g = s.section("gemini")
+        return GeminiScorer(
+            s.profile, s.gemini_api_key, model=g.get("model", "gemini-3.5-flash-lite"),
+            thresholds=thresholds, feedback_examples=examples,
+            min_interval=float(g.get("min_interval_sec", 6.0)),
+        )
+    if provider == "ollama":
+        o = s.section("ollama")
+        return OllamaScorer(
+            s.profile, model=o.get("model", "gemma3:4b"),
+            host=o.get("host", "http://localhost:11434"), thresholds=thresholds,
+            feedback_examples=examples, num_ctx=int(o.get("num_ctx", 8192)), think=o.get("think"),
+        )
+    if provider == "claude":
+        if not s.anthropic_key_present:
+            sys.exit("scoring.provider is claude but ANTHROPIC_API_KEY is not set in .env")
+        c = s.section("claude")
+        return LLMScorer(
+            s.profile, model=c.get("model", DEFAULT_MODEL), effort=c.get("effort", "medium"),
+            thresholds=thresholds, feedback_examples=examples,
+        )
+    if provider != "heuristic":
+        sys.exit(f"unknown scoring.provider: {provider} (auto|gemini|ollama|claude|heuristic)")
+    if not no_llm:
+        log.warning("no LLM configured – using the heuristic (keyword) scorer")
+    return HeuristicScorer(s.profile, thresholds)
 
 
 def build_telegram(s: Settings, required: bool = False) -> Telegram | None:
@@ -139,6 +180,33 @@ def cmd_show(s: Settings, db: DB, a) -> int:
     return 0
 
 
+SAMPLE_VACANCY = Vacancy(
+    source="djinni", source_id="0", url="https://djinni.co/jobs/0-sample/",
+    title="Head of Marketing", company="Sample Defence Tech", remote=True,
+    description=(
+        "We are a Ukrainian defence-tech product company. Looking for a Head of Marketing to "
+        "build the brand platform and positioning, own go-to-market for new products, lead a "
+        "team of 6 and work with agencies. 8+ years in marketing leadership required."
+    ),
+)
+
+
+def cmd_llm_check(s: Settings, db: DB, a) -> int:
+    """One scoring call on a built-in sample vacancy – verifies keys/model/Ollama setup."""
+    provider = resolve_provider(s)
+    print(f"provider: {provider}")
+    scorer = build_scorer(s, db, no_llm=False)
+    print(f"scorer:   {scorer.name}\n")
+    try:
+        r = scorer.score(SAMPLE_VACANCY)
+    except Exception as e:
+        print(f"❌ FAILED: {e}")
+        return 1
+    print(json.dumps(r.to_dict(), ensure_ascii=False, indent=2))
+    print("\n✅ OK")
+    return 0
+
+
 def cmd_rescore(s: Settings, db: DB, a) -> int:
     row = db.get(a.id)
     if row is None:
@@ -169,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("tg-setup", help="show chat ids that wrote to the bot").set_defaults(fn=cmd_tg_setup)
     sub.add_parser("tg-test", help="send a test message").set_defaults(fn=cmd_tg_test)
     sub.add_parser("stats", help="counts by source/status").set_defaults(fn=cmd_stats)
+    sub.add_parser("llm-check", help="score a sample vacancy to test the LLM setup").set_defaults(
+        fn=cmd_llm_check
+    )
 
     sh = sub.add_parser("show", help="list vacancies by status")
     sh.add_argument("--status", default="sent,scored")

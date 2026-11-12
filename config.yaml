@@ -59,11 +59,26 @@ rules:
   max_age_days: 21
 
 scoring:
-  model: claude-opus-5-5
-  effort: medium
-  max_per_run: 40              # LLM calls per run; the rest waits for the next run
+  # auto = Gemini if GEMINI_API_KEY is set (free tier), else Claude if ANTHROPIC_API_KEY,
+  #        else the heuristic keyword scorer. Or pick one: gemini | ollama | claude | heuristic
+  provider: auto
+  max_per_run: 25              # LLM calls per run; the rest waits for the next run
   feedback_examples: 6         # past ✅/⏭ reactions shown to the model for calibration
   thresholds: {apply: 80, maybe: 55}
+
+gemini:                        # free tier: https://aistudio.google.com/apikey
+  model: gemini-3.5-flash-lite # free; check limits at aistudio.google.com/rate-limit
+  min_interval_sec: 6          # ≤10 requests/minute – stays under free-tier RPM
+
+ollama:                        # fully local and free: https://ollama.com/download
+  model: gemma3:4b             # 3.4 GB; better but bigger: qwen3:8b (5.2 GB), gemma3:12b (8.2 GB)
+  host: http://localhost:11434
+  num_ctx: 8192
+  # think: false               # uncomment for "thinking" models such as qwen3 to make them faster
+
+claude:                        # paid: https://console.anthropic.com
+  model: claude-opus-5-5
+  effort: medium
 
 notify:
   min_score: 55

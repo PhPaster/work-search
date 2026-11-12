@@ -1,16 +1,22 @@
 """Scoring a vacancy against the owner's profile.
 
-LLMScorer      — Claude via the official Anthropic SDK, strict JSON output (output_config.format).
-HeuristicScorer — no-API fallback: keyword overlap with the profile. Used when there is no
-                  ANTHROPIC_API_KEY or with `--no-llm`, so the pipeline always works end to end.
+GeminiScorer    — Google Gemini over REST (free tier available), JSON-schema output.
+OllamaScorer    — a local model via Ollama (fully free and offline), JSON-schema output.
+LLMScorer       — Claude via the official Anthropic SDK, strict JSON output (output_config.format).
+HeuristicScorer — no-API fallback: keyword overlap with the profile. Used with `--no-llm`
+                  or when no provider is configured, so the pipeline always works end to end.
+
+All LLM scorers share the same system prompt, schema and result post-processing.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Protocol
 
+import httpx
 import yaml
 
 from ..models import ScoreResult, Vacancy
@@ -106,10 +112,180 @@ def _verdict_for(score: int, thresholds: dict) -> str:
     return "skip"
 
 
+JSON_REMINDER = (
+    "\n\nReturn ONLY a JSON object with keys: score (integer 0-100), verdict "
+    '("apply"|"maybe"|"skip"), matched (array of strings), gaps (array of strings), '
+    "red_flags (array of strings), why (string), cover_hook (string)."
+)
+
+
+def result_from_data(data: dict, thresholds: dict, scorer: str) -> ScoreResult:
+    """Validate model JSON and keep the verdict consistent with our thresholds."""
+    if not isinstance(data, dict) or "score" not in data:
+        raise ValueError(f"model returned no score: {str(data)[:200]}")
+    score = max(0, min(100, int(round(float(data["score"])))))
+    raw_verdict = str(data.get("verdict", "")).lower()
+    # a deal-breaker "skip" from the model always wins; otherwise thresholds decide
+    verdict = "skip" if raw_verdict == "skip" else _verdict_for(score, thresholds)
+
+    def strings(key: str) -> list[str]:
+        val = data.get(key) or []
+        return [str(x) for x in val] if isinstance(val, list) else [str(val)]
+
+    return ScoreResult(
+        score=score,
+        verdict=verdict,
+        matched=strings("matched"),
+        gaps=strings("gaps"),
+        red_flags=strings("red_flags"),
+        why=str(data.get("why") or ""),
+        cover_hook=str(data.get("cover_hook") or ""),
+        scorer=scorer,
+    )
+
+
+def _parse_json_text(text: str) -> dict:
+    text = (text or "").strip()
+    if text.startswith("```"):  # tolerate ```json fences from weaker models
+        text = text.strip("`")
+        text = text[text.find("{"):]
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON object in model output: {text[:200]}")
+    return json.loads(text[start : end + 1])
+
+
+class RateLimited(RuntimeError):
+    """Provider quota hit: stop scoring for this run, the rest waits for the next run."""
+
+
 class Scorer(Protocol):
     name: str
 
     def score(self, v: Vacancy) -> ScoreResult: ...
+
+
+class _Paced:
+    """Keeps at least `min_interval` seconds between calls (free tiers have low RPM)."""
+
+    min_interval: float = 0.0
+    _last: float = 0.0
+
+    def _pace(self) -> None:
+        if self.min_interval and self._last:
+            wait = self.min_interval - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last = time.monotonic()
+
+
+class GeminiScorer(_Paced):
+    """Google Gemini `generateContent` over REST. Free tier: limits are per project, see AI Studio."""
+
+    URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    def __init__(
+        self,
+        profile: dict,
+        api_key: str,
+        model: str = "gemini-3.5-flash-lite",
+        thresholds: dict | None = None,
+        feedback_examples: list[dict] | None = None,
+        min_interval: float = 6.0,
+        http: httpx.Client | None = None,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.thresholds = thresholds or {"apply": 80, "maybe": 55}
+        self.system = build_system_prompt(profile, feedback_examples)
+        self.min_interval = min_interval
+        self.http = http or httpx.Client(timeout=120)
+        self.name = f"gemini:{model}"
+        self._schema_mode = True  # flips to plain JSON mode if the API rejects the schema field
+
+    def _body(self, v: Vacancy) -> dict:
+        gen: dict = {"responseMimeType": "application/json", "temperature": 0.2}
+        if self._schema_mode:
+            gen["responseJsonSchema"] = SCORE_SCHEMA
+        return {
+            "systemInstruction": {"parts": [{"text": self.system}]},
+            "contents": [{"role": "user", "parts": [{"text": vacancy_prompt(v) + JSON_REMINDER}]}],
+            "generationConfig": gen,
+        }
+
+    def score(self, v: Vacancy) -> ScoreResult:
+        self._pace()
+        url = self.URL.format(model=self.model)
+        headers = {"x-goog-api-key": self.api_key}
+        resp = self.http.post(url, headers=headers, json=self._body(v))
+        if resp.status_code == 400 and self._schema_mode and "responseJsonSchema" in resp.text:
+            log.warning("Gemini rejected responseJsonSchema, falling back to plain JSON mode")
+            self._schema_mode = False
+            resp = self.http.post(url, headers=headers, json=self._body(v))
+        if resp.status_code == 429:
+            raise RateLimited(f"Gemini quota exceeded: {resp.text[:300]}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        if data.get("promptFeedback", {}).get("blockReason"):
+            raise RuntimeError(f"Gemini blocked the prompt: {data['promptFeedback']}")
+        cand = (data.get("candidates") or [{}])[0]
+        finish = cand.get("finishReason", "")
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        if finish not in ("STOP", "") and not text:
+            raise RuntimeError(f"Gemini finished with {finish}")
+        return result_from_data(_parse_json_text(text), self.thresholds, self.name)
+
+
+class OllamaScorer(_Paced):
+    """A local model through Ollama's /api/chat. Free, offline, needs `ollama pull <model>`."""
+
+    def __init__(
+        self,
+        profile: dict,
+        model: str = "gemma3:4b",
+        host: str = "http://localhost:11434",
+        thresholds: dict | None = None,
+        feedback_examples: list[dict] | None = None,
+        num_ctx: int = 8192,
+        think: bool | None = None,
+        http: httpx.Client | None = None,
+    ):
+        self.model = model
+        self.host = host.rstrip("/")
+        self.thresholds = thresholds or {"apply": 80, "maybe": 55}
+        self.system = build_system_prompt(profile, feedback_examples)
+        self.num_ctx = num_ctx
+        self.think = think
+        self.http = http or httpx.Client(timeout=600)  # local models can be slow on a laptop
+        self.name = f"ollama:{model}"
+
+    def score(self, v: Vacancy) -> ScoreResult:
+        body: dict = {
+            "model": self.model,
+            "stream": False,
+            "format": SCORE_SCHEMA,
+            "options": {"temperature": 0, "num_ctx": self.num_ctx},
+            "messages": [
+                {"role": "system", "content": self.system},
+                {"role": "user", "content": vacancy_prompt(v, max_chars=8000) + JSON_REMINDER},
+            ],
+        }
+        if self.think is not None:
+            body["think"] = self.think
+        try:
+            resp = self.http.post(f"{self.host}/api/chat", json=body)
+        except httpx.ConnectError as e:
+            raise RuntimeError(
+                f"Ollama is not running at {self.host} (start the Ollama app or `ollama serve`)"
+            ) from e
+        if resp.status_code == 404:
+            raise RuntimeError(f"Ollama model {self.model!r} not found – run `ollama pull {self.model}`")
+        if resp.status_code != 200:
+            raise RuntimeError(f"Ollama HTTP {resp.status_code}: {resp.text[:300]}")
+        content = (resp.json().get("message") or {}).get("content", "")
+        return result_from_data(_parse_json_text(content), self.thresholds, self.name)
 
 
 class LLMScorer:
@@ -151,20 +327,7 @@ class LLMScorer:
         if resp.stop_reason == "max_tokens":
             raise RuntimeError(f"output truncated for {v.url}")
         text = next((b.text for b in resp.content if b.type == "text"), "")
-        data = json.loads(text)
-        score = max(0, min(100, int(data["score"])))
-        # keep the verdict consistent with our thresholds; the deal-breaker "skip" always wins
-        verdict = data["verdict"] if data["verdict"] == "skip" else _verdict_for(score, self.thresholds)
-        return ScoreResult(
-            score=score,
-            verdict=verdict,
-            matched=list(data.get("matched") or []),
-            gaps=list(data.get("gaps") or []),
-            red_flags=list(data.get("red_flags") or []),
-            why=data.get("why") or "",
-            cover_hook=data.get("cover_hook") or "",
-            scorer=f"llm:{resp.model}",
-        )
+        return result_from_data(json.loads(text), self.thresholds, f"llm:{resp.model}")
 
 
 class HeuristicScorer:

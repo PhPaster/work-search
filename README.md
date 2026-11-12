@@ -4,7 +4,11 @@
 **Djinni**, **Work.ua**, **Robota.ua**, оцінює їх щодо вашого профілю (Claude) і надсилає
 в Telegram ті, на які варто відгукнутися.
 
-Повний опис архітектури, рішень і статусу: **[BIBLE.md](BIBLE.md)**.
+- **Покрокове налаштування для початківця (усе безкоштовно): [SETUP.md](SETUP.md)**
+- Повний опис архітектури, рішень і статусу: [BIBLE.md](BIBLE.md)
+
+Оцінка вакансій (`scoring.provider` у `config.yaml`): **Gemini** (безкоштовний тариф),
+**Ollama** (локально, безкоштовно), **Claude** (платно) або евристика за ключовими словами.
 
 ## Швидкий старт
 
@@ -13,7 +17,7 @@
 uv sync
 
 # 2. налаштування
-cp .env.example .env                    # ключі: Anthropic, Telegram, (опц.) IMAP
+cp .env.example .env                    # ключі: Gemini (або Ollama/Claude), Telegram, (опц.) IMAP
 cp profile.example.yaml profile.yaml    # ваш профіль — його читає LLM
 
 # 3. перевірка без Telegram і без LLM
@@ -33,7 +37,8 @@ uv run jobradar run
 |---|---|
 | `jobradar run` | зібрати → відфільтрувати → оцінити → надіслати |
 | `jobradar run --dry-run` | те саме, але друкує в консоль; нічого не позначає як надіслане |
-| `jobradar run --no-llm` | евристичний скоринг замість Claude (безкоштовно) |
+| `jobradar run --no-llm` | евристичний скоринг замість LLM |
+| `jobradar llm-check` | оцінити тестову вакансію: перевірка ключа, моделі чи Ollama |
 | `jobradar run --sources djinni` | лише вибрані джерела (`djinni`, `email`) |
 | `jobradar feedback` | забрати натискання кнопок ✅/⏭ з Telegram |
 | `jobradar stats` | кількість вакансій за джерелом і статусом |

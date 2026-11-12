@@ -37,6 +37,7 @@ class Settings:
 
     # secrets (from env)
     anthropic_key_present: bool
+    gemini_api_key: str | None
     telegram_token: str | None
     telegram_chat_id: str | None
     imap_host: str | None
@@ -74,6 +75,7 @@ def load_settings(
         anthropic_key_present=bool(
             os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
         ),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or None,
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
         imap_host=os.environ.get("IMAP_HOST") or None,

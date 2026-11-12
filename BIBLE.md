@@ -28,7 +28,8 @@ cron/launchd ─▶ jobradar run                         (jobradar/runner.py)
   4. enrich        collector.enrich(v)                (повний опис, компанія, ЗП, remote)
   5. rules         pipeline/rules.py                  → rule_rejected
   6. dedup         pipeline/dedup.py (компанія+назва) → duplicate
-  7. score         pipeline/scorer.py (Claude | евристика) → scored | error (до 3 спроб)
+  7. score         pipeline/scorer.py (Gemini | Ollama | Claude | евристика)
+                   → scored | error (до 3 спроб); 429 від провайдера → зупинка, решта чекає
   8. notify        notify/telegram.py: apply → окремі повідомлення з кнопками,
                    maybe → один дайджест, решта → тихо позначається як оброблена (sent)
   9. alert         якщо джерело зламалося → ⚠️ у Telegram (не частіше 1 разу на добу)
@@ -48,8 +49,13 @@ cron/launchd ─▶ jobradar run                         (jobradar/runner.py)
 | Work.ua і Robota.ua читаються через **e-mail-розсилки (IMAP)** | Обидва сайти віддають не-браузерним клієнтам Cloudflare JS-challenge (403). Обходити захист від ботів ми **свідомо не будемо**. Розсилки ж є легальним офіційним каналом. Деталі в §4. |
 | Двоступеневий фільтр: regex по назві → LLM | Пошук на сайтах дає багато шуму (~80% відсіюється назвою), а LLM викликається лише для релевантного. |
 | Кожна вакансія оцінюється LLM лише раз | Стан зберігається в SQLite, тому повторні запуски дешеві. |
-| Claude `claude-opus-5-5`, effort `medium`, structured output (JSON schema) | Строгий JSON без парсингу тексту. `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`) перезапускає запит на іншій моделі, якщо модель відмовила. Модель і effort задаються в `config.yaml`. |
-| Евристичний скоринг як fallback | Без `ANTHROPIC_API_KEY` або з `--no-llm` пайплайн усе одно працює (збіг ключових слів профілю). |
+| **Пріоритет безкоштовних інструментів** (рішення власника) | `scoring.provider: auto` обирає Gemini (безкоштовний тариф), якщо є `GEMINI_API_KEY`; інакше Claude, якщо є ключ Anthropic; інакше евристику. Ollama вмикається явно. |
+| Gemini: REST `generateContent`, `gemini-3.5-flash-lite`, `responseMimeType` + `responseJsonSchema` | На безкоштовному тарифі модель «Free of charge», і Google радить її для дешевих масових задач. Схема JSON примусова. Якщо API відхилить `responseJsonSchema`, скорер сам переходить у простий JSON-режим (`_schema_mode`). Між запитами пауза 6 с (`gemini.min_interval_sec`). `generateContent` у документації названо legacy, але він підтримується; рекомендованим є Interactions API. |
+| Ollama: `/api/chat`, `format` = JSON-схема, `gemma3:4b` (3.4 ГБ) | Повністю локально і безкоштовно. Маленька модель обрана, бо диск власника заповнений на 96% (вільно ~21 ГБ). Кращі варіанти: `qwen3:8b` (5.2 ГБ), `gemma3:12b` (8.2 ГБ). |
+| Claude `claude-opus-5-5`, effort `medium`, structured output (JSON schema) | Платний варіант. Строгий JSON; `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`) перезапускає запит на іншій моделі, якщо модель відмовила. Налаштування в розділі `claude:` конфігу. |
+| Спільний промпт, схема і `result_from_data` для всіх LLM | Однакова логіка вердикту: пороги з конфігу, а «skip» від моделі (стоп-фактор) завжди перемагає. |
+| `RateLimited` (HTTP 429) зупиняє скоринг на цей прогін | На безкоштовному тарифі ліміт може закінчитися посеред прогону. Вакансії лишаються в `new` без витрачання спроб. |
+| Евристичний скоринг як fallback | Без жодного LLM або з `--no-llm` пайплайн усе одно працює (збіг ключових слів профілю). |
 | Telegram через сирий Bot API (`httpx`) | Бібліотека не потрібна. Кнопки читаються через `getUpdates` на початку кожного прогону, тож постійно запущений бот-процес теж не потрібен. |
 | `--dry-run` нічого не «споживає» | Оцінені в dry-run вакансії підуть у Telegram при першому бойовому запуску. |
 | Чесний User-Agent і пауза ≥2 с між запитами до одного хоста | Ввічливість; robots.txt Djinni дозволяє `/jobs/`. |
@@ -102,11 +108,12 @@ cron/launchd ─▶ jobradar run                         (jobradar/runner.py)
 ```
 BIBLE.md                 цей файл
 README.md                швидкий старт
+SETUP.md                 покрокове налаштування для власника-початківця
 config.yaml              пошуки, фільтри, пороги, модель (без секретів)
 profile.example.yaml     шаблон профілю → копія в profile.yaml (git-ignored)
 .env.example             ключі → копія в .env (git-ignored)
 jobradar/
-  cli.py                 команди: run, feedback, tg-setup, tg-test, stats, show, rescore
+  cli.py                 команди: run, feedback, tg-setup, tg-test, stats, show, rescore, llm-check
   runner.py              оркестрація прогону (RunReport, process_feedback)
   config.py              завантаження config/profile/.env → Settings
   db.py                  SQLite: vacancies + meta (tg_offset, last_run, last_collector_alert)
@@ -119,7 +126,7 @@ jobradar/
   pipeline/title_match.py     роль+домен у вікні N слів, точні C-level, виключення
   pipeline/rules.py      стоп-слова, мін. ЗП (USD), макс. вік
   pipeline/dedup.py      ключ «компанія|назва» для крос-сайтового дедупу
-  pipeline/scorer.py     LLMScorer (Anthropic SDK) і HeuristicScorer
+  pipeline/scorer.py     GeminiScorer (REST), OllamaScorer, LLMScorer (Claude, Anthropic SDK), HeuristicScorer
   notify/telegram.py     форматування (HTML), кнопки, getUpdates
 scripts/run.sh           один прогін із логом (для cron/launchd)
 scripts/com.jobradar.run.plist.template   launchd, кожні 2 год
@@ -128,7 +135,7 @@ tests/                   pytest; fixtures/ — урізаний реальний
 
 ## 6. Конфігурація і секрети
 
-- `.env`: `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IMAP_HOST`,
+- `.env`: `GEMINI_API_KEY` (або `GOOGLE_API_KEY`), `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IMAP_HOST`,
   `IMAP_USER`, `IMAP_PASSWORD` (для Gmail потрібен *пароль застосунку*), опційно `JOBRADAR_DB`.
 - `config.yaml`, найважливіше:
   - `djinni.searches`: список параметрів RSS;
@@ -136,7 +143,9 @@ tests/                   pytest; fixtures/ — урізаний реальний
     Через них «Chief Marketing/Retention Officer» теж відсіюється. Це свідомо, але правиться тут;
   - `rules.exclude_keywords`: за замовчуванням `gambling, igaming, casino, betting`
     (⚠ припущення про вподобання власника, треба підтвердити);
-  - `scoring.max_per_run: 40` обмежує кількість LLM-викликів за прогін;
+  - `scoring.provider`: `auto | gemini | ollama | claude | heuristic`; налаштування кожного
+    провайдера в однойменних розділах `gemini:`, `ollama:` і `claude:`;
+  - `scoring.max_per_run: 25` обмежує кількість LLM-викликів за прогін;
   - `notify.min_score`, `scoring.thresholds` (apply ≥80, maybe ≥55).
 - `profile.yaml` повністю потрапляє в системний промпт. Блок `keywords` використовується тільки евристикою.
   Поточний профіль власника складено з paster.pro. `preferences` і `deal_breakers` позначені ⚠
@@ -144,9 +153,12 @@ tests/                   pytest; fixtures/ — урізаний реальний
 
 ## 7. Як запускати і тестувати
 
+Покрокова інструкція для власника (початківця): **[SETUP.md](SETUP.md)**.
+
 ```bash
 uv sync
-uv run pytest                                   # 66 тестів, офлайн
+uv run pytest                                   # 75 тестів, офлайн
+uv run jobradar llm-check                       # один виклик LLM на тестовій вакансії
 uv run jobradar --db /tmp/t.sqlite3 run --dry-run --no-llm   # живий Djinni, без витрат
 uv run jobradar tg-setup && uv run jobradar tg-test          # після налаштування бота
 uv run jobradar run                              # бойовий прогін
@@ -160,7 +172,16 @@ uv run jobradar run                              # бойовий прогін
 
 ## 8. Вартість
 
-На старті Djinni дає ~20–25 релевантних вакансій, далі ~2–6 нових на день.
+**Типова конфігурація безкоштовна:** Djinni RSS, Telegram, Gmail IMAP, launchd на Mac,
+Gemini на безкоштовному тарифі або Ollama локально.
+- Gemini free: ліміти встановлюються на проєкт і публікуються лише в AI Studio
+  (https://aistudio.google.com/rate-limit). За даними розробників на осінь 2026 року, для Flash-Lite
+  це приблизно 15 RPM і 500 RPD, а для Flash лише ~20 RPD. Нам треба ~25 запитів у перший день,
+  а далі кілька на день. На безкоштовному тарифі Google використовує контент для покращення
+  продуктів. У промпт потрапляють публічні вакансії й профіль із публічного сайту.
+- Ollama: $0, обмеження лише на диск і швидкість ноутбука.
+
+Платний варіант (Claude): на старті Djinni дає ~20–25 релевантних вакансій, далі ~2–6 нових на день.
 Один скоринг — це ~3–5K вхідних і ~1–2K вихідних токенів (разом із thinking) на `claude-opus-5-5`
 ($4 / $20 за 1M), тобто приблизно $0.03–0.06 за вакансію і кілька доларів на місяць (оцінка,
 не вимір: після першого бойового прогону треба звірити з usage в консолі Anthropic).
@@ -179,13 +200,20 @@ uv run jobradar run                              # бойовий прогін
 - [x] Алерт у Telegram, коли джерело зламалося
 - [x] CLI, launchd-шаблон, 66 тестів
 
+- [x] Безкоштовні провайдери: Gemini (безкоштовний тариф) і Ollama, команда `llm-check`, SETUP.md для початківця
+
 Не перевірено вживу (бракує ключів на машині розробки):
+- [ ] Реальний виклик Gemini: власник вписує `GEMINI_API_KEY`, після чого `jobradar llm-check`.
+      Зокрема перевірити, чи `generateContent` приймає `responseJsonSchema`
+      (у разі відмови автоматично вмикається простий JSON-режим, а в лозі з'явиться попередження)
+- [ ] Реальний виклик Ollama: Ollama на машині не встановлено
 - [ ] Реальний виклик Claude: потрібен `ANTHROPIC_API_KEY`, після чого `jobradar rescore <id>`
 - [ ] Реальне надсилання в Telegram: потрібні токен бота і `tg-setup`
 - [ ] Реальні листи Work.ua/Robota.ua: потрібні підписки, IMAP і калібрування парсера
 
 Наступні кроки:
-1. Власник: заповнити `.env`, підтвердити ⚠-припущення в `profile.yaml` і `rules.exclude_keywords`.
+1. Власник: пройти SETUP.md (Gemini або Ollama, Telegram), підтвердити ⚠-припущення в
+   `profile.yaml` і `rules.exclude_keywords`.
 2. Перший бойовий прогін, перевірити якість оцінок LLM на 10–20 вакансіях, підкрутити промпт і пороги.
 3. Налаштувати підписки на work.ua і robota.ua (запити: «маркетинг директор», «head of marketing»,
    «бренд директор», «стратегічний директор», «CMO»), увімкнути `email_alerts.enabled`.
