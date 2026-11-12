@@ -1,0 +1,73 @@
+# jobradar configuration (no secrets here – they live in .env)
+
+djinni:
+  enabled: true
+  fetch_details: true          # open each matching vacancy page for company/salary/remote
+  # Each entry = query params of https://djinni.co/jobs/rss/?...
+  # all_keywords is a full-text AND search; primary_keyword is a whole category.
+  searches:
+    - {primary_keyword: Marketing}          # catch-all: latest marketing vacancies
+    - {all_keywords: CMO}
+    - {all_keywords: Chief Marketing Officer}
+    - {all_keywords: Head of Marketing}
+    - {all_keywords: Marketing Director}
+    - {all_keywords: Director of Marketing}
+    - {all_keywords: Brand Director}
+    - {all_keywords: Head of Brand}
+    - {all_keywords: Brand Lead}
+    - {all_keywords: Head of Strategy}
+    - {all_keywords: Strategy Director}
+    - {all_keywords: Strategic Director}
+    - {all_keywords: директор з маркетингу}
+    - {all_keywords: маркетинг-директор}
+    - {all_keywords: бренд-директор}
+    - {all_keywords: стратегічний директор}
+
+# Work.ua + Robota.ua: both block non-browser clients with Cloudflare, so we read their
+# own e-mail job alerts instead (see BIBLE.md §4). Needs IMAP_* in .env.
+email_alerts:
+  enabled: false
+  sites: [workua, robotaua]
+  folder: INBOX                # Gmail: "INBOX" or "[Gmail]/All Mail"
+  days_back: 3
+
+title_filter:
+  window: 3                    # max words between "head/director/lead" and "marketing/brand/strategy"
+  exclude:                     # specialist roles that are not the target even with "Head of"
+    - performance
+    - smm
+    - seo
+    - crm
+    - retention
+    - affiliate
+    - cpa
+    - ppc
+    - media buy
+    - media buying
+    - lead generation
+    - leadgen
+    - client service
+    - account
+  extra_role_stems: []
+  extra_domain_stems: [gtm]      # "GTM Lead" – go-to-market leadership
+  extra_exact: []
+
+rules:
+  # dropped before the LLM (title, company and description are searched)
+  exclude_keywords: [gambling, igaming, casino, betting, гемблінг]
+  min_salary_usd: null         # e.g. 3000 – only applied when a salary is published
+  max_age_days: 21
+
+scoring:
+  model: claude-opus-5-5
+  effort: medium
+  max_per_run: 40              # LLM calls per run; the rest waits for the next run
+  feedback_examples: 6         # past ✅/⏭ reactions shown to the model for calibration
+  thresholds: {apply: 80, maybe: 55}
+
+notify:
+  min_score: 55
+  send_maybe: true             # "maybe" vacancies arrive as one digest message per run
+
+http:
+  min_interval_sec: 2.0        # politeness delay between requests to the same host

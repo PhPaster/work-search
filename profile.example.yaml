@@ -1,0 +1,39 @@
+# Copy to profile.yaml (git-ignored) and describe yourself.
+# The whole file is given to the LLM as the candidate profile; `keywords` also drive
+# the offline heuristic scorer.
+
+headline: "Head of Marketing / Brand Director — brand strategy and marketing leadership"
+target_titles:
+  - Head of Marketing
+  - Marketing Director
+  - CMO
+  - Brand Director
+  - Head of Brand
+  - Brand Lead
+  - Head of Strategy
+  - Strategy Director
+seniority: "Head / Director / C-level"
+experience_years: 10
+
+core_competencies:
+  - Brand strategy and positioning
+  - Communication strategy
+  - Go-to-market strategy
+  - Team leadership
+
+industries: [Tech, SaaS, consumer brands]
+
+selected_cases:
+  - "Client X (2023): repositioning that grew awareness by N%"
+
+preferences:
+  work_format: "remote or hybrid"
+  company_type: "product companies and strong brands"
+
+deal_breakers:
+  - gambling / iGaming / betting
+
+keywords:
+  strong: [brand strategy, positioning, go-to-market, communication strategy, brand platform]
+  plus: [research, insight, team leadership, budget, b2b, saas]
+  deal_breakers: [gambling, igaming, casino, betting]

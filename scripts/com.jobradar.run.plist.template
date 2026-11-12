@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd job: runs jobradar every 2 hours (and after wake if a run was missed).
+     Install:  sed "s#__REPO__#$PWD#g" scripts/com.jobradar.run.plist.template > ~/Library/LaunchAgents/com.jobradar.run.plist
+               launchctl load ~/Library/LaunchAgents/com.jobradar.run.plist
+     Remove:   launchctl unload ~/Library/LaunchAgents/com.jobradar.run.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jobradar.run</string>
+  <key>ProgramArguments</key>
+  <array><string>__REPO__/scripts/run.sh</string></array>
+  <key>StartInterval</key><integer>7200</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>__REPO__/data/logs/launchd.err</string>
+</dict>
+</plist>
