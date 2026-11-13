@@ -35,10 +35,30 @@ cron/launchd ─▶ jobradar run                         (jobradar/runner.py)
                    опційно maybe → дайджест у кінці (notify.maybe_as_digest); решта → тихо sent
   9. alert         якщо джерело зламалося → ⚠️ у Telegram (не частіше 1 разу на добу)
 
-Автоматизація: launchd (`~/Library/LaunchAgents/com.jobradar.run.plist`) запускає
-`scripts/run.sh` кожні 2 год (StartInterval 7200) і одразу після входу в систему; пропущений
-через сон запуск виконується після пробудження. Лог: `data/logs/run-YYYY-MM.log`.
-Захист від накладання: `fcntl.flock` на `data/jobradar.sqlite3.lock` (другий прогін одразу виходить).
+Автоматизація (з 13.11.2026, за зразком PhPaster/shafa-watcher): **GitHub Actions + Apps Script**.
+- `.github/workflows/radar.yml` виконує `uv run jobradar run` на `ubuntu-latest`. Репозиторій
+  публічний, тож хвилини Actions безкоштовні.
+- **Будильник** — `tools/trigger.gs` у Google Apps Script власника: щогодини робить `workflow_dispatch`.
+  Замок: пропуск, якщо останній запуск ще йде або стартував < 45 хв тому.
+  Сторож: немає успішного запуску 3 год → ⚠️ у Telegram (не частіше ніж раз на 6 год), відновилось → ✅;
+  за 14 днів до кінця строку дії токена GitHub → 🔑. Токен fine-grained, лише цей репозиторій, Actions: R/W.
+- **Резерв** — `schedule` кожні 3 год (`23 */3`). Задача `gate` пропускає запуск, якщо тригер
+  спрацьовував за останні 70 хв. Розклад GitHub ненадійний: запізнюється, а в shafa-watcher
+  взагалі не спрацював за 40 хв.
+- `concurrency: jobradar` гарантує, що одночасно працює лише один прогін.
+- **Стан** — SQLite → gzip → AES-256-CBC (PBKDF2, 200k ітерацій, ключ `secrets.STATE_KEY`, копія в
+  локальному `.env`) → `state.db.enc` в orphan-гілці `state` (один коміт, force-push після кожного прогону,
+  навіть невдалого). `scripts/state.sh pack|unpack|pull|push`. Шифрування, бо репозиторій публічний,
+  а в базі є аналізи, що спираються на досвід власника.
+- **Профіль** — секрет `PROFILE_YAML` (`gh secret set PROFILE_YAML < profile.yaml`); у раннері пишеться в `profile.yaml`.
+  Після зміни профілю — Run workflow з `requeue: true`.
+- Секрети: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PROFILE_YAML`, `STATE_KEY`.
+- **Не запускати `jobradar run` локально**, бо в локальної бази інша пам'ять і будуть дублікати.
+  Для аналізу: `scripts/state.sh pull` → `jobradar stats/show`.
+- launchd-варіант (`scripts/run.sh`, `scripts/com.jobradar.run.plist.template`) лишився як запасний.
+  Нюанс: проєкт у `~/Documents`, а macOS TCC не пускає туди фонові задачі (`Operation not permitted`);
+  знадобиться Full Disk Access для `/bin/bash` або інша папка.
+- `run.lock` (`fcntl.flock`) лишається для локальних запусків.
 
 Ліміти безкоштовного Gemini (`jobradar/budget.py`):
 - кожен HTTP-запит до Gemini (зокрема повтори на 503) рахується в `meta.llm_used` за
@@ -186,6 +206,7 @@ tests/                   pytest; fixtures/ — урізаний реальний
 ```bash
 uv sync
 uv run pytest                                   # 86 тестів, офлайн
+scripts/state.sh pull                           # завантажити хмарний стан локально
 uv run jobradar llm-check                       # один виклик LLM на тестовій вакансії
 uv run jobradar --db /tmp/t.sqlite3 run --dry-run --no-llm   # живий Djinni, без витрат
 uv run jobradar tg-setup && uv run jobradar tg-test          # після налаштування бота
@@ -238,6 +259,14 @@ Gemini на безкоштовному тарифі або Ollama локальн
 - [x] Перший бойовий прогін власника (13.11, 14:34–14:39): 4 apply + 6 maybe у Telegram, 2 помилки 503.
       Проблема: повідомлення йшли лише в кінці прогону, тому тепер вони надсилаються одразу після оцінки.
 - [x] Профіль переписано з CV, гемблінг дозволений зі штрафом, команда `requeue`
+
+- [x] Хмара (13.11): `radar.yml` у GitHub Actions — перший прогін успішний (run 43434662387):
+      Djinni доступний з IP GitHub (193 вакансії), зашифрований стан відновлено й збережено,
+      дублікатів немає. Локальний launchd вимкнено, plist видалено.
+- [ ] Власник: токен GitHub + проєкт Apps Script (`tools/trigger.gs`, SETUP.md крок 7). Доти
+      працює лише резервний розклад GitHub раз на 3 год.
+- [ ] Gemini у хмарі ще не викликався (у першому прогоні не було нових релевантних вакансій);
+      секрет `GEMINI_API_KEY` задано.
 
 Не перевірено вживу:
 - [ ] Реальний виклик Ollama: Ollama на машині не встановлено
