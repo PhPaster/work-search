@@ -156,7 +156,12 @@ function check() {
   const res = gh_('/runs?per_page=5');
   const h = res.getHeaders();
   console.log(`repository: ${res.getResponseCode()} (404 = repo not selected in the token; 401 = invalid token)`);
-  console.log(`token expires: ${header_(h, 'github-authentication-token-expiration') || 'never'}`);
+  if (res.getResponseCode() !== 200) {
+    // on 401/404 GitHub sends no expiry header, so "never" would be misleading
+    console.warn('token NOT accepted – check GH_TOKEN in Script Properties (saved? full value?)');
+  } else {
+    console.log(`token expires: ${header_(h, 'github-authentication-token-expiration') || 'never'}`);
+  }
   if (res.getResponseCode() === 200) {
     JSON.parse(res.getContentText()).workflow_runs.forEach((r) =>
       console.log(`${r.created_at} ${r.event} ${r.status}/${r.conclusion || '—'}`));
