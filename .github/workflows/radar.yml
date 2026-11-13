@@ -1,0 +1,100 @@
+name: jobradar
+
+# Self-start (see SETUP.md → «Автозапуск у хмарі»):
+#   1. Google Apps Script (tools/trigger.gs): workflow_dispatch every hour + watchdog in Telegram.
+#   2. This schedule every 3 h as a backup: the `gate` job lets the run through only if nothing
+#      started the workflow in the last 70 min (GitHub's cron is often late or skipped).
+# State (SQLite) lives encrypted in the orphan branch `state` (the repo is public).
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      requeue:
+        description: "Re-score skipped / rule-rejected vacancies first (after editing the profile)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: jobradar
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from datetime import datetime, timezone
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/radar.yml/runs?per_page=10",
+              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json"})
+          runs = [r for r in json.load(urllib.request.urlopen(req, timeout=20))["workflow_runs"]
+                  if str(r["id"]) != os.environ["GITHUB_RUN_ID"] and r["event"] != "schedule"]
+          now = datetime.now(timezone.utc)
+          age = min(((now - datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
+                     for r in runs), default=1e9)
+          run = age >= 70
+          print(f"last triggered run {age:.0f} min ago -> {'running backup' if run else 'not needed'}")
+          if run:
+              print("::warning::Apps Script trigger has not started the workflow for 70+ min; GitHub backup schedule ran it")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'1' if run else '0'}\n")
+          PY
+
+  radar:
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == '1') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PROFILE_YAML: ${{ secrets.PROFILE_YAML }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Restore state
+        run: |
+          if git fetch -q --depth=1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:state.db.enc > state.db.enc
+            scripts/state.sh unpack
+          else
+            echo "no state branch yet – starting with an empty database"
+          fi
+
+      - name: Write profile
+        run: |
+          test -n "$PROFILE_YAML" || { echo "::error::secret PROFILE_YAML is empty"; exit 1; }
+          printf '%s\n' "$PROFILE_YAML" > profile.yaml
+
+      - name: Requeue
+        if: ${{ github.event.inputs.requeue == 'true' }}
+        run: uv run --frozen jobradar requeue --skipped --rule-rejected
+
+      - name: Run jobradar
+        run: uv run --frozen jobradar run
+
+      - name: Stats
+        if: always()
+        run: uv run --frozen jobradar stats | tail -4 || true
+
+      - name: Save state
+        if: always() && hashFiles('data/jobradar.sqlite3') != ''
+        run: scripts/state.sh push
