@@ -8,6 +8,7 @@ import logging
 import sys
 from pathlib import Path
 
+from .budget import DailyBudget
 from .collectors.base import Collector
 from .collectors.djinni import DjinniCollector
 from .collectors.email_alerts import EmailAlertsCollector
@@ -81,6 +82,8 @@ def build_scorer(s: Settings, db: DB, no_llm: bool):
             s.profile, s.gemini_api_key, model=g.get("model", "gemini-3.5-flash-lite"),
             thresholds=thresholds, feedback_examples=examples,
             min_interval=float(g.get("min_interval_sec", 6.0)),
+            fallback_models=g.get("fallback_models") or [],
+            retries=int(g.get("retries", 3)),
         )
     if provider == "ollama":
         o = s.section("ollama")
@@ -113,25 +116,55 @@ def build_telegram(s: Settings, required: bool = False) -> Telegram | None:
 
 
 # ---------------------------------------------------------------- commands
+def _acquire_run_lock(db_path: Path):
+    """One run at a time (launchd + a manual run must not overlap). Returns the open lock file."""
+    import fcntl
+
+    lock_path = Path(str(db_path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
+def build_budget(s: Settings, db: DB, scorer) -> DailyBudget | None:
+    """Daily request cap for providers with a free-tier quota (Gemini)."""
+    if not getattr(scorer, "name", "").startswith("gemini:"):
+        return None
+    limit = s.section("gemini").get("max_requests_per_day", 150)
+    return DailyBudget(db, None if limit in (None, 0) else int(limit))
+
+
 def cmd_run(s: Settings, db: DB, a) -> int:
+    lock = _acquire_run_lock(a.db or s.db_path)
+    if lock is None:
+        print("another jobradar run is in progress – skipping this one")
+        return 0
     http = PoliteClient(min_interval=float(s.section("http").get("min_interval_sec", 2.0)))
     only = set(a.sources.split(",")) if a.sources else None
     tg = None if (a.dry_run or a.no_telegram) else build_telegram(s)
     if tg is not None and not s.telegram_chat_id:
         sys.exit("TELEGRAM_CHAT_ID is not set – run `jobradar tg-setup` first")
+    scorer = build_scorer(s, db, a.no_llm)
     runner = Runner(
         db=db,
         collectors=build_collectors(s, only, http),
         matcher=TitleMatcher.from_config(s.section("title_filter")),
         rules=Rules.from_config(s.section("rules")),
-        scorer=build_scorer(s, db, a.no_llm),
+        scorer=scorer,
         telegram=tg,
         notify_cfg=s.section("notify"),
         max_scores_per_run=int(s.section("scoring").get("max_per_run", 40)),
         dry_run=a.dry_run,
+        budget=build_budget(s, db, scorer),
     )
     report = runner.run()
     http.close()
+    lock.close()
     print("\n" + report.summary())
     return 1 if report.collector_errors and not report.collected else 0
 
@@ -169,6 +202,11 @@ def cmd_tg_test(s: Settings, db: DB, a) -> int:
 def cmd_stats(s: Settings, db: DB, a) -> int:
     print(json.dumps(db.stats(), ensure_ascii=False, indent=2))
     print("last_run:", db.get_meta("last_run"))
+    limit = s.section("gemini").get("max_requests_per_day", 150)
+    b = DailyBudget(db, limit)
+    print(f"gemini requests today (Pacific day): {b.used()} / {limit}")
+    if until := b.paused_until():
+        print(f"LLM paused until {until.astimezone():%Y-%m-%d %H:%M} (daily quota)")
     return 0
 
 
@@ -204,6 +242,30 @@ def cmd_llm_check(s: Settings, db: DB, a) -> int:
         return 1
     print(json.dumps(r.to_dict(), ensure_ascii=False, indent=2))
     print("\n✅ OK")
+    return 0
+
+
+def cmd_requeue(s: Settings, db: DB, a) -> int:
+    """Send already-seen vacancies back to scoring (e.g. after editing profile.yaml or rules).
+
+    Never touches vacancies that were already delivered to Telegram.
+    """
+    n_skip = n_rule = 0
+    if a.skipped:
+        for row in db.conn.execute(
+            "SELECT id FROM vacancies WHERE status='sent' AND tg_message_id IS NULL"
+        ).fetchall():
+            db.set_status(row["id"], "new", "requeued")
+            n_skip += 1
+    if a.rule_rejected:
+        rules = Rules.from_config(s.section("rules"))
+        for row in db.by_status("rule_rejected"):
+            ok, _ = rules.check(row_to_vacancy(row))
+            if ok:
+                db.set_status(row["id"], "new", "requeued")
+                n_rule += 1
+    print(f"requeued: {n_skip} previously skipped, {n_rule} previously rule-rejected")
+    print("run `uv run jobradar run` to score them")
     return 0
 
 
@@ -245,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
     sh.add_argument("--status", default="sent,scored")
     sh.add_argument("--limit", type=int, default=30)
     sh.set_defaults(fn=cmd_show)
+
+    rq = sub.add_parser("requeue", help="re-score already seen vacancies after profile/rule changes")
+    rq.add_argument("--skipped", action="store_true", help="scored low and not sent to Telegram")
+    rq.add_argument("--rule-rejected", action="store_true", help="dropped by rules that now pass")
+    rq.set_defaults(fn=cmd_requeue)
 
     rs = sub.add_parser("rescore", help="score one stored vacancy again and print it")
     rs.add_argument("id", type=int)

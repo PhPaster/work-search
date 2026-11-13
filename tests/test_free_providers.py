@@ -71,6 +71,30 @@ def test_gemini_falls_back_to_plain_json_mode():
     assert calls == [True, False, False]  # remembers the fallback
 
 
+def test_gemini_busy_retries_then_falls_back_to_second_model():
+    calls = []
+
+    def handler(req):
+        model = str(req.url).split("/models/")[1].split(":")[0]
+        calls.append(model)
+        if model == "main":
+            return httpx.Response(503, json={"error": {"message": "high demand"}})
+        return gemini_ok(json.dumps(RESULT))
+
+    s = GeminiScorer({}, "KEY", model="main", fallback_models=["spare"], min_interval=0,
+                     backoff=0, http=client(handler))
+    r = s.score(VAC)
+    assert calls == ["main", "main", "main", "spare"]
+    assert r.scorer == "gemini:spare"
+
+
+def test_gemini_all_models_busy_raises_rate_limited():
+    s = GeminiScorer({}, "KEY", model="a", fallback_models=["b"], min_interval=0, backoff=0,
+                     http=client(lambda r: httpx.Response(503, text="busy")))
+    with pytest.raises(RateLimited, match="unavailable"):
+        s.score(VAC)
+
+
 def test_gemini_rate_limit_and_errors():
     s = GeminiScorer({}, "KEY", min_interval=0, http=client(lambda r: httpx.Response(429, text="quota")))
     with pytest.raises(RateLimited):

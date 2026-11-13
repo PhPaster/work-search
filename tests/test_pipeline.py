@@ -214,8 +214,9 @@ def test_runner_end_to_end():
     assert rep.scored == 3 and scorer.calls == 3
     assert sorted(col.enriched) == ["1", "2", "4", "6"]  # details only for title matches
     assert rep.sent_apply == 1 and rep.sent_maybe == 1
+    # each vacancy goes out as its own message right after it is scored
     assert tg.sent[0] == ("vacancy", 1, "Head of Marketing")
-    assert "Brand Director" in tg.sent[1][1]
+    assert tg.sent[1] == ("vacancy", 2, "Brand Director")
     assert "fake" in rep.collector_errors  # the failing collector is reported…
     assert any("джерела не відповіли" in s[1] for s in tg.sent if s[0] == "text")  # …and alerted
 
@@ -280,3 +281,58 @@ def test_feedback_buttons():
     assert db.get_meta("tg_offset") == "12"
     assert process_feedback(db, tg) == 0  # offset respected
     assert db.feedback_examples()[0]["feedback"] == "applied"
+
+
+def test_messages_are_sent_during_scoring_not_after():
+    db = DB(":memory:")
+    tg = _FakeTelegram()
+    sent_when_scoring = []
+
+    class Watching(_FixedScorer):
+        def score(self, v):
+            sent_when_scoring.append(len(tg.sent))
+            return super().score(v)
+
+    items = [V(source_id=str(i), title="Head of Marketing") for i in range(3)]
+    _runner(db, [_ListCollector(items)], Watching({"Head of Marketing": 90}), tg).run()
+    assert sent_when_scoring == [0, 1, 2]  # message k was already out before scoring k+1
+
+
+def test_maybe_digest_mode():
+    db = DB(":memory:")
+    tg = _FakeTelegram()
+    r = _runner(db, [_ListCollector([V(source_id="1"), V(source_id="2", title="Brand Director")])],
+                _FixedScorer({"Head of Marketing": 90, "Brand Director": 60}), tg)
+    r.notify_cfg = {"min_score": 55, "maybe_as_digest": True}
+    rep = r.run()
+    assert tg.sent[0] == ("vacancy", 1, "Head of Marketing")
+    assert tg.sent[1][0] == "text" and "Brand Director" in tg.sent[1][1]
+    assert (rep.sent_apply, rep.sent_maybe) == (1, 1)
+
+
+def test_heuristic_penalty_lowers_but_keeps():
+    s = HeuristicScorer({"keywords": {"strong": ["brand strategy"], "penalty": ["igaming"]}})
+    plain = s.score(V(description="brand strategy"))
+    gamb = s.score(V(description="brand strategy for an iGaming brand"))
+    assert gamb.score == plain.score - 15
+    assert any("нижчий пріоритет" in f for f in gamb.red_flags)
+
+
+def test_requeue_command(tmp_path):
+    from jobradar.cli import main
+
+    dbp = tmp_path / "t.sqlite3"
+    db = DB(dbp)
+    a = db.insert(V(source_id="1"), status="new")
+    db.save_score(a, ScoreResult(score=30, verdict="skip"))
+    db.mark_sent(a, None)                                   # low score, not delivered
+    b = db.insert(V(source_id="2"), status="new")
+    db.save_score(b, ScoreResult(score=90, verdict="apply"))
+    db.mark_sent(b, 555)                                    # delivered – must stay
+    c = db.insert(V(source_id="3", description="iGaming"), status="rule_rejected", reason="keyword: igaming")
+    db.close()
+
+    assert main(["--db", str(dbp), "requeue", "--skipped", "--rule-rejected"]) == 0
+    db = DB(dbp)
+    assert db.get(a)["status"] == "new" and db.get(b)["status"] == "sent"
+    assert db.get(c)["status"] == "new"  # config.yaml no longer excludes gambling

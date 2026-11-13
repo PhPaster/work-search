@@ -44,6 +44,7 @@ uv run jobradar run
 | `jobradar stats` | кількість вакансій за джерелом і статусом |
 | `jobradar show --status sent` | список вакансій |
 | `jobradar rescore 123` | переоцінити одну вакансію й показати результат |
+| `jobradar requeue --skipped --rule-rejected` | після зміни профілю/правил: повернути відсіяні (і не надіслані) вакансії на переоцінку |
 
 ## Розклад
 

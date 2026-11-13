@@ -32,6 +32,8 @@ class RunReport:
     scored: int = 0
     errors: int = 0
     rate_limited: bool = False
+    llm_requests: int = 0
+    llm_paused: bool = False
     sent_apply: int = 0
     sent_maybe: int = 0
     feedback: int = 0
@@ -79,7 +81,9 @@ class Runner:
         max_scores_per_run: int = 40,
         dry_run: bool = False,
         printer=print,
+        budget=None,  # DailyBudget | None
     ):
+        self.budget = budget
         self.db = db
         self.collectors = collectors
         self.by_name = {c.name: c for c in collectors}
@@ -137,6 +141,12 @@ class Runner:
 
     def _score_pending(self, report: RunReport) -> None:
         pending = [r for r in self.db.by_status("new", "error")]
+        if self.budget is not None and pending:
+            until = self.budget.paused_until()
+            if until is not None:
+                log.info("LLM paused until %s (daily quota), %d vacancies wait", until, len(pending))
+                report.llm_paused = True
+                return
         budget = self.max_scores
         for row in pending:
             attempts = 0
@@ -145,37 +155,101 @@ class Runner:
                 if attempts >= MAX_ATTEMPTS:
                     continue
             if budget <= 0:
-                log.info("score budget exhausted, %d left for next run", len(pending))
+                log.info("per-run score limit reached, the rest waits for the next run")
+                break
+            if self.budget is not None and self.budget.remaining() <= 0:
+                log.info("daily LLM budget (%s requests) used up, the rest waits", self.budget.limit)
+                report.llm_paused = True
                 break
             budget -= 1
             v = row_to_vacancy(row)
+            before = getattr(self.scorer, "requests_made", None)
             try:
                 result = self.scorer.score(v)
             except RateLimited as e:
-                # free-tier quota: not the vacancy's fault, keep it pending for the next run
+                # not the vacancy's fault: keep it pending for the next run
+                self._count_requests(before, report)
                 log.warning("%s – stopping scoring for this run", e)
                 report.rate_limited = True
+                if e.quota and self.budget is not None:
+                    self._pause_for_quota()
+                    report.llm_paused = True
                 break
             except Exception as e:
+                self._count_requests(before, report)
                 log.error("scoring #%s failed: %s", row["id"], e)
                 self.db.set_status(row["id"], "error", f"attempt {attempts + 1}: {e}"[:500])
                 report.errors += 1
                 continue
+            self._count_requests(before, report)
             self.db.save_score(row["id"], result)
             report.scored += 1
+            self._send_now(row["id"], v, result, report)
+
+    def _count_requests(self, before: int | None, report: RunReport) -> None:
+        after = getattr(self.scorer, "requests_made", None)
+        n = (after - before) if (before is not None and after is not None) else 1
+        report.llm_requests += n
+        if self.budget is not None:
+            self.budget.add(n)
+
+    def _pause_for_quota(self) -> None:
+        until = self.budget.pause_until_reset()
+        log.warning("daily LLM quota exhausted – pausing scoring until %s UTC", until)
+        if self.tg is None or self.dry_run:
+            return
+        local = until.astimezone().strftime("%H:%M %d.%m")
+        try:
+            self.tg.send(
+                "⏸ <b>jobradar</b>: денний безкоштовний ліміт Gemini вичерпано. "
+                f"Нові вакансії зберігаються й будуть оцінені після {local}."
+            )
+        except TelegramError as e:
+            log.error("cannot send quota notice: %s", e)
+
+    # ------------------------------------------------------------------ notify
+    @property
+    def _min_score(self) -> int:
+        return int(self.notify_cfg.get("min_score", 55))
+
+    def _wanted(self, r: ScoreResult) -> str | None:
+        """'each' (own message), 'digest', or None (not sent)."""
+        if r.score < self._min_score:
+            return None
+        if r.verdict == "apply":
+            return "each"
+        if r.verdict == "maybe" and self.notify_cfg.get("send_maybe", True):
+            return "digest" if self.notify_cfg.get("maybe_as_digest", False) else "each"
+        return None
+
+    def _send_now(self, row_id: int, v: Vacancy, r: ScoreResult, report: RunReport) -> None:
+        """Send right after scoring, so results arrive while the run is still going."""
+        if self.tg is None or self.dry_run or self._wanted(r) != "each":
+            return
+        try:
+            mid = self.tg.send_vacancy(row_id, v, r)
+        except TelegramError as e:
+            log.error("telegram send failed for #%s: %s", row_id, e)
+            return  # stays 'scored' and is retried at the end of the run / next run
+        self.db.mark_sent(row_id, mid)
+        if r.verdict == "apply":
+            report.sent_apply += 1
+        else:
+            report.sent_maybe += 1
+        time.sleep(0.5)
 
     def _notify(self, report: RunReport) -> None:
-        min_score = int(self.notify_cfg.get("min_score", 55))
-        send_maybe = bool(self.notify_cfg.get("send_maybe", True))
+        """Whatever is still 'scored': digests, earlier send failures, dry-run output."""
         apply_items, maybe_items = [], []
         for row in self.db.by_status("scored"):
             r = ScoreResult.from_dict(json.loads(row["analysis"]))
             v = row_to_vacancy(row)
-            if r.verdict == "apply" and r.score >= min_score:
+            mode = self._wanted(r)
+            if mode == "each":
                 apply_items.append((row["id"], v, r))
-            elif r.verdict == "maybe" and r.score >= min_score and send_maybe:
+            elif mode == "digest":
                 maybe_items.append((row["id"], v, r))
-            else:
+            elif not self.dry_run:
                 # below the bar: mark as handled so it isn't reconsidered every run
                 self.db.mark_sent(row["id"], None)
         apply_items.sort(key=lambda x: -x[2].score)
@@ -189,18 +263,14 @@ class Runner:
             if not self.dry_run:  # no Telegram configured: treat console as the channel
                 for row_id, _, _ in apply_items + maybe_items:
                     self.db.mark_sent(row_id, None)
-            report.sent_apply, report.sent_maybe = len(apply_items), len(maybe_items)
+            report.sent_apply += sum(1 for _, _, r in apply_items if r.verdict == "apply")
+            report.sent_maybe += len(maybe_items) + sum(
+                1 for _, _, r in apply_items if r.verdict != "apply"
+            )
             return
 
         for row_id, v, r in apply_items:
-            try:
-                mid = self.tg.send_vacancy(row_id, v, r)
-            except TelegramError as e:
-                log.error("telegram send failed for #%s: %s", row_id, e)
-                continue
-            self.db.mark_sent(row_id, mid)
-            report.sent_apply += 1
-            time.sleep(0.5)
+            self._send_now(row_id, v, r, report)
         if maybe_items:
             # Telegram messages max out at 4096 chars – send the digest in chunks of 12
             for i in range(0, len(maybe_items), 12):

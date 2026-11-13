@@ -30,9 +30,27 @@ cron/launchd ─▶ jobradar run                         (jobradar/runner.py)
   6. dedup         pipeline/dedup.py (компанія+назва) → duplicate
   7. score         pipeline/scorer.py (Gemini | Ollama | Claude | евристика)
                    → scored | error (до 3 спроб); 429 від провайдера → зупинка, решта чекає
-  8. notify        notify/telegram.py: apply → окремі повідомлення з кнопками,
-                   maybe → один дайджест, решта → тихо позначається як оброблена (sent)
+  8. notify        notify/telegram.py: кожна вакансія ≥ notify.min_score (55) надсилається
+                   ОДРАЗУ після оцінки окремим повідомленням (бал, причини, посилання, кнопки);
+                   опційно maybe → дайджест у кінці (notify.maybe_as_digest); решта → тихо sent
   9. alert         якщо джерело зламалося → ⚠️ у Telegram (не частіше 1 разу на добу)
+
+Автоматизація: launchd (`~/Library/LaunchAgents/com.jobradar.run.plist`) запускає
+`scripts/run.sh` кожні 2 год (StartInterval 7200) і одразу після входу в систему; пропущений
+через сон запуск виконується після пробудження. Лог: `data/logs/run-YYYY-MM.log`.
+Захист від накладання: `fcntl.flock` на `data/jobradar.sqlite3.lock` (другий прогін одразу виходить).
+
+Ліміти безкоштовного Gemini (`jobradar/budget.py`):
+- кожен HTTP-запит до Gemini (зокрема повтори на 503) рахується в `meta.llm_used` за
+  «тихоокеанський» день, бо RPD free tier скидається опівночі за Pacific (10:00 за Києвом);
+- `gemini.max_requests_per_day: 150`: коли ліміт вичерпано, оцінка зупиняється, вакансії
+  лишаються в `new` і оцінюються наступного дня;
+- якщо Google відповідає 429 на всіх моделях (реальна квота скінчилася раніше за наш ліміт),
+  оцінка ставиться на паузу до 00:05 Pacific (`meta.llm_paused_until`), і в Telegram
+  надходить одне повідомлення ⏸;
+- 503 «high demand»: 3 спроби з паузою 5→10 с → запасна модель → зупинка до наступного прогону;
+- між запитами пауза 6 с (≤10 RPM).
+Збір вакансій (Djinni) працює завжди, навіть на паузі, тому нічого не губиться.
 ```
 
 Статуси в `vacancies.status`: `title_rejected`, `rule_rejected`, `duplicate`, `new`
@@ -141,15 +159,25 @@ tests/                   pytest; fixtures/ — урізаний реальний
   - `djinni.searches`: список параметрів RSS;
   - `title_filter.exclude`: агресивні виключення (performance, smm, crm, retention, affiliate…).
     Через них «Chief Marketing/Retention Officer» теж відсіюється. Це свідомо, але правиться тут;
-  - `rules.exclude_keywords`: за замовчуванням `gambling, igaming, casino, betting`
-    (⚠ припущення про вподобання власника, треба підтвердити);
+  - `rules.exclude_keywords: []`: гемблінг **не відсіюється** (рішення власника 13.11);
+    натомість `profile.yaml → scoring_guidance` просить модель знімати ~15 балів, а евристика
+    знімає 15 балів за `keywords.penalty`;
   - `scoring.provider`: `auto | gemini | ollama | claude | heuristic`; налаштування кожного
     провайдера в однойменних розділах `gemini:`, `ollama:` і `claude:`;
   - `scoring.max_per_run: 25` обмежує кількість LLM-викликів за прогін;
-  - `notify.min_score`, `scoring.thresholds` (apply ≥80, maybe ≥55).
+  - `notify.min_score`, `scoring.thresholds` (apply ≥80, maybe ≥55), `notify.maybe_as_digest`;
+  - `gemini.fallback_models: [gemini-3.1-flash-lite]`, `gemini.retries: 3`.
 - `profile.yaml` повністю потрапляє в системний промпт. Блок `keywords` використовується тільки евристикою.
-  Поточний профіль власника складено з paster.pro. `preferences` і `deal_breakers` позначені ⚠
-  як припущення.
+  Поточний профіль (13.11.2026) складено з `~/Documents/CV_Paster_master_2026_UA.odt` (найсвіжіше
+  резюме: досвід TWID, TRENDFORMER, TBWA, banda, GRAPE, Dentsu; компетенції; освіта) + кейсів
+  з paster.pro + відповідей власника:
+  - формат: віддалено, Київ гібрид/офіс, інші міста України; переїзд за кордон — ні;
+  - мінімальної зарплати немає; гемблінг дозволений з нижчим пріоритетом.
+  **Контакти (телефон, e-mail, LinkedIn) навмисно не включено**, бо профіль іде в LLM (Gemini free).
+  Розділи: `summary`, `experience`, `selected_cases` (з них модель бере `cover_hook`),
+  `competencies`, `industries`, `preferences`, `scoring_guidance` (правила оцінки), `deal_breakers`, `keywords`.
+- Після зміни профілю чи правил: `jobradar requeue --skipped --rule-rejected` повертає на
+  переоцінку вакансії, які раніше відсіяли й **не** надіслали в Telegram (надіслані не чіпаються).
 
 ## 7. Як запускати і тестувати
 
@@ -157,7 +185,7 @@ tests/                   pytest; fixtures/ — урізаний реальний
 
 ```bash
 uv sync
-uv run pytest                                   # 75 тестів, офлайн
+uv run pytest                                   # 86 тестів, офлайн
 uv run jobradar llm-check                       # один виклик LLM на тестовій вакансії
 uv run jobradar --db /tmp/t.sqlite3 run --dry-run --no-llm   # живий Djinni, без витрат
 uv run jobradar tg-setup && uv run jobradar tg-test          # після налаштування бота
@@ -201,21 +229,24 @@ Gemini на безкоштовному тарифі або Ollama локальн
 - [x] CLI, launchd-шаблон, 66 тестів
 
 - [x] Безкоштовні провайдери: Gemini (безкоштовний тариф) і Ollama, команда `llm-check`, SETUP.md для початківця
+- [x] Реальний виклик Gemini (13.11): `gemini-3.5-flash-lite`, безкоштовний тариф, `responseJsonSchema` приймається.
+      Перша версія промпту давала `matched` англійською і загальний `cover_hook`. Після посилення
+      промпту (усі поля українською, `cover_hook` обов'язково з конкретним кейсом) і профілю з CV
+      відповіді конкретні (Gurzuf, Vyriy, TWID).
+- [x] Gemini часто віддає 503 «high demand»: 3 спроби з паузою → запасна модель → `RateLimited`
+      (оцінка зупиняється, вакансії чекають наступного прогону, спроби не витрачаються).
+- [x] Перший бойовий прогін власника (13.11, 14:34–14:39): 4 apply + 6 maybe у Telegram, 2 помилки 503.
+      Проблема: повідомлення йшли лише в кінці прогону, тому тепер вони надсилаються одразу після оцінки.
+- [x] Профіль переписано з CV, гемблінг дозволений зі штрафом, команда `requeue`
 
-Не перевірено вживу (бракує ключів на машині розробки):
-- [x] Реальний виклик Gemini (2026-11-13): `llm-check` → `gemini-3.5-flash-lite`, безкоштовний тариф,
-      `responseJsonSchema` приймається (fallback не знадобився). Помічено: `matched` модель інколи пише
-      англійською, а `cover_hook` виходить загальним, без конкретного кейсу. Якщо на реальних
-      вакансіях це заважатиме, спробувати `gemini-3.8-flash` (але там менший денний ліміт) або підсилити промпт.
+Не перевірено вживу:
 - [ ] Реальний виклик Ollama: Ollama на машині не встановлено
 - [ ] Реальний виклик Claude: потрібен `ANTHROPIC_API_KEY`, після чого `jobradar rescore <id>`
-- [ ] Реальне надсилання в Telegram: потрібні токен бота і `tg-setup`
 - [ ] Реальні листи Work.ua/Robota.ua: потрібні підписки, IMAP і калібрування парсера
 
 Наступні кроки:
-1. Власник: пройти SETUP.md (Gemini або Ollama, Telegram), підтвердити ⚠-припущення в
-   `profile.yaml` і `rules.exclude_keywords`.
-2. Перший бойовий прогін, перевірити якість оцінок LLM на 10–20 вакансіях, підкрутити промпт і пороги.
+1. Власник: натискати ✅/⏭ під вакансіями (це калібрує модель).
+2. Через тиждень переглянути `jobradar stats` і реакції: чи збігаються бали з ✅/⏭, підкрутити `scoring_guidance` і пороги.
 3. Налаштувати підписки на work.ua і robota.ua (запити: «маркетинг директор», «head of marketing»,
    «бренд директор», «стратегічний директор», «CMO»), увімкнути `email_alerts.enabled`.
 4. Зберегти реальний лист кожного сайту як фікстуру й відкалібрувати парсер.

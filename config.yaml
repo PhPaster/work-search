@@ -54,7 +54,8 @@ title_filter:
 
 rules:
   # dropped before the LLM (title, company and description are searched)
-  exclude_keywords: [gambling, igaming, casino, betting, гемблінг]
+  # Gambling is NOT excluded: the profile asks the model to lower its priority instead.
+  exclude_keywords: []
   min_salary_usd: null         # e.g. 3000 – only applied when a salary is published
   max_age_days: 21
 
@@ -69,6 +70,12 @@ scoring:
 gemini:                        # free tier: https://aistudio.google.com/apikey
   model: gemini-3.5-flash-lite # free; check limits at aistudio.google.com/rate-limit
   min_interval_sec: 6          # ≤10 requests/minute – stays under free-tier RPM
+  retries: 3                   # per model on HTTP 5xx ("high demand"), 5s → 10s backoff
+  # Hard cap on Gemini HTTP requests per day (resets at midnight Pacific = 10:00 Kyiv, like the
+  # free tier). Normal days need ~5–20; the cap only matters for backlogs. 0 = no cap.
+  # If Google still answers 429 on every model, scoring pauses until the reset (Telegram notice).
+  max_requests_per_day: 150
+  fallback_models: [gemini-3.1-flash-lite]   # also free; used when the main model is busy or out of quota
 
 ollama:                        # fully local and free: https://ollama.com/download
   model: gemma3:4b             # 3.4 GB; better but bigger: qwen3:8b (5.2 GB), gemma3:12b (8.2 GB)
@@ -82,7 +89,9 @@ claude:                        # paid: https://console.anthropic.com
 
 notify:
   min_score: 55
-  send_maybe: true             # "maybe" vacancies arrive as one digest message per run
+  send_maybe: true             # also send "maybe" (55–79) vacancies
+  maybe_as_digest: false       # false: each one as its own message right after scoring
+                               # true: "maybe" ones as one list at the end of the run
 
 http:
   min_interval_sec: 2.0        # politeness delay between requests to the same host

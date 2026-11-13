@@ -21,7 +21,10 @@ def _e(s: str) -> str:
 
 
 def format_vacancy(v: Vacancy, r: ScoreResult) -> str:
-    head = f"{VERDICT_ICON.get(r.verdict, '')} <b>{r.score}/100</b> — <b>{_e(v.title)}</b>"
+    head = (
+        f"{VERDICT_ICON.get(r.verdict, '')} <b>{r.score}/100</b> — "
+        f"<a href=\"{_e(v.url)}\"><b>{_e(v.title)}</b></a>"
+    )
     sub = " · ".join(
         x for x in [_e(v.company), SOURCE_LABEL.get(v.source, v.source)] if x
     )

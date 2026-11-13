@@ -30,10 +30,16 @@ preferences:
   work_format: "remote or hybrid"
   company_type: "product companies and strong brands"
 
-deal_breakers:
-  - gambling / iGaming / betting
+scoring_guidance:   # free-form rules the model must follow
+  - "Best fit: a role owning strategy + brand + GTM with a budget and a team."
+  - "Gambling / iGaming: not a deal-breaker, but lower priority — subtract ~15 points."
+  - "Mandatory relocation abroad: verdict skip."
 
-keywords:
+deal_breakers:
+  - mandatory relocation abroad
+
+keywords:           # used only by the offline heuristic scorer
   strong: [brand strategy, positioning, go-to-market, communication strategy, brand platform]
   plus: [research, insight, team leadership, budget, b2b, saas]
-  deal_breakers: [gambling, igaming, casino, betting]
+  penalty: [gambling, igaming, casino, betting]        # −15 points
+  deal_breakers: [relocation required]                 # score 10, skip

@@ -53,15 +53,21 @@ How to judge:
 - Then substance: brand strategy, positioning, communication and go-to-market work, team
   leadership, budget ownership, agency/client-side experience, the industries in the profile.
 - Respect the candidate's deal-breakers strictly: if one clearly applies, verdict is "skip".
+- Follow the candidate's `scoring_guidance` (priorities, penalties) exactly as written.
 - Missing information (no salary, vague description) is a red flag, not a reason to skip.
 - If the description is only a short e-mail snippet, judge mostly by title/company and say
   that details must be checked on the page.
 
 Scoring: 80-100 strong fit -> "apply"; 55-79 worth a look -> "maybe"; below 55 -> "skip".
 
-Output language: Ukrainian for `why`, `matched`, `gaps`, `red_flags` and `cover_hook`.
-`why`: 2-3 sentences. `cover_hook`: one sentence the candidate could open a cover letter with,
-referring to a concrete case or achievement from the profile that fits this vacancy.
+Language: write EVERY text value in Ukrainian — `why`, every item of `matched`, `gaps`,
+`red_flags`, and `cover_hook` (keep established English terms such as GTM, P&L, SaaS as is).
+`matched` / `gaps`: short phrases naming the specific requirement of the vacancy and the
+matching (or missing) experience of the candidate, e.g. "GTM на ринки ЄС — досвід TRENDFORMER".
+`why`: 2-3 sentences. `cover_hook`: one sentence the candidate could open a cover letter with;
+it MUST name a specific company, case or measurable result from the profile (e.g. Effie for
+McDonald's at TBWA, Target launch at TRENDFORMER, MilTech clients at TWID) that is the most
+relevant to this vacancy — never a generic claim.
 
 <candidate_profile>
 {profile}
@@ -156,7 +162,15 @@ def _parse_json_text(text: str) -> dict:
 
 
 class RateLimited(RuntimeError):
-    """Provider quota hit: stop scoring for this run, the rest waits for the next run."""
+    """Provider unavailable: stop scoring for this run, the rest waits for the next run.
+
+    quota=True means the daily quota is used up (HTTP 429 on every model): the runner then
+    pauses LLM scoring until the provider's daily reset instead of retrying every run.
+    """
+
+    def __init__(self, msg: str, quota: bool = False):
+        super().__init__(msg)
+        self.quota = quota
 
 
 class Scorer(Protocol):
@@ -193,15 +207,24 @@ class GeminiScorer(_Paced):
         feedback_examples: list[dict] | None = None,
         min_interval: float = 6.0,
         http: httpx.Client | None = None,
+        fallback_models: list[str] | None = None,
+        retries: int = 3,
+        backoff: float = 5.0,
     ):
         self.api_key = api_key
         self.model = model
+        # 503 "high demand" and per-model quotas are common on the free tier:
+        # retry with backoff, then try the next model
+        self.models = [model] + [m for m in (fallback_models or []) if m and m != model]
+        self.retries = max(1, retries)
+        self.backoff = backoff
         self.thresholds = thresholds or {"apply": 80, "maybe": 55}
         self.system = build_system_prompt(profile, feedback_examples)
         self.min_interval = min_interval
         self.http = http or httpx.Client(timeout=120)
         self.name = f"gemini:{model}"
         self._schema_mode = True  # flips to plain JSON mode if the API rejects the schema field
+        self.requests_made = 0  # every HTTP call counts against the free-tier RPD
 
     def _body(self, v: Vacancy) -> dict:
         gen: dict = {"responseMimeType": "application/json", "temperature": 0.2}
@@ -213,17 +236,50 @@ class GeminiScorer(_Paced):
             "generationConfig": gen,
         }
 
-    def score(self, v: Vacancy) -> ScoreResult:
-        self._pace()
-        url = self.URL.format(model=self.model)
+    def _post(self, model: str, v: Vacancy) -> httpx.Response:
+        url = self.URL.format(model=model)
         headers = {"x-goog-api-key": self.api_key}
+        self.requests_made += 1
         resp = self.http.post(url, headers=headers, json=self._body(v))
         if resp.status_code == 400 and self._schema_mode and "responseJsonSchema" in resp.text:
             log.warning("Gemini rejected responseJsonSchema, falling back to plain JSON mode")
             self._schema_mode = False
+            self.requests_made += 1
             resp = self.http.post(url, headers=headers, json=self._body(v))
-        if resp.status_code == 429:
-            raise RateLimited(f"Gemini quota exceeded: {resp.text[:300]}")
+        return resp
+
+    def score(self, v: Vacancy) -> ScoreResult:
+        self._pace()
+        problems = []
+        quota_models = 0
+        for model in self.models:
+            for attempt in range(self.retries):
+                try:
+                    resp = self._post(model, v)
+                except httpx.TransportError as e:
+                    problems.append(f"{model}: {type(e).__name__}")
+                    time.sleep(self.backoff * (2**attempt))
+                    continue
+                if resp.status_code in (500, 502, 503, 504):
+                    problems.append(f"{model}: HTTP {resp.status_code}")
+                    if attempt + 1 < self.retries:
+                        log.info("Gemini %s busy (HTTP %s), retry %d", model, resp.status_code, attempt + 1)
+                        time.sleep(self.backoff * (2**attempt))
+                    continue
+                if resp.status_code == 429:
+                    problems.append(f"{model}: quota (429)")
+                    quota_models += 1
+                    break  # quotas are per model: try the next one
+                return self._parse(resp, model)
+            if model != self.models[-1]:
+                log.warning("Gemini %s unavailable, switching to %s", model, self.models[self.models.index(model) + 1])
+        # every model busy or out of quota: stop scoring this run, retry next run
+        raise RateLimited(
+            "Gemini unavailable: " + "; ".join(problems[-4:]),
+            quota=quota_models == len(self.models),
+        )
+
+    def _parse(self, resp: httpx.Response, model: str) -> ScoreResult:
         if resp.status_code != 200:
             raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
@@ -235,7 +291,7 @@ class GeminiScorer(_Paced):
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         if finish not in ("STOP", "") and not text:
             raise RuntimeError(f"Gemini finished with {finish}")
-        return result_from_data(_parse_json_text(text), self.thresholds, self.name)
+        return result_from_data(_parse_json_text(text), self.thresholds, f"gemini:{model}")
 
 
 class OllamaScorer(_Paced):
@@ -341,6 +397,7 @@ class HeuristicScorer:
         self.strong = [normalize(k) for k in kw.get("strong") or []]
         self.plus = [normalize(k) for k in kw.get("plus") or []]
         self.deal_breakers = [normalize(k) for k in kw.get("deal_breakers") or []]
+        self.penalty = [normalize(k) for k in kw.get("penalty") or []]
         self.senior_title = [normalize(k) for k in profile.get("target_titles") or []]
 
     def score(self, v: Vacancy) -> ScoreResult:
@@ -359,6 +416,10 @@ class HeuristicScorer:
         plus = [k for k in self.plus if k and f" {k}" in hay]
         score += min(30, 6 * len(strong)) + min(10, 3 * len(plus))
         red = []
+        penalized = [k for k in self.penalty if k and f" {k}" in hay]
+        if penalized:
+            score -= 15
+            red.append("нижчий пріоритет: " + ", ".join(penalized))
         if not v.salary_text():
             red.append("зарплата не вказана")
         if v.description_is_snippet:
