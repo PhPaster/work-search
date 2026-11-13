@@ -31,10 +31,10 @@ const STALE_MIN = 180;      // watchdog: alert if there was no successful run fo
 const ALERT_EVERY_H = 6;    // repeat the alert at most this often
 const EXPIRY_WARN_D = 14;   // remind about the token this many days before it expires
 
-const props = () => PropertiesService.getScriptProperties();
+const props_ = () => PropertiesService.getScriptProperties();
 
 function gh_(path, method, payload) {
-  const token = props().getProperty('GH_TOKEN')?.trim();
+  const token = props_().getProperty('GH_TOKEN')?.trim();
   if (!token) throw new Error('GH_TOKEN is missing in Script Properties');
   const opts = {
     method: method || 'get',
@@ -63,8 +63,8 @@ function runs_() {
 function minutesSince_(iso) { return (Date.now() - new Date(iso).getTime()) / 60000; }
 
 function tg_(text) {
-  const token = props().getProperty('TG_TOKEN')?.trim();
-  const chat = props().getProperty('TG_CHAT')?.trim();
+  const token = props_().getProperty('TG_TOKEN')?.trim();
+  const chat = props_().getProperty('TG_CHAT')?.trim();
   if (!token || !chat) { console.warn('TG_TOKEN/TG_CHAT missing — watchdog messages are off'); return; }
   const res = UrlFetchApp.fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'post', contentType: 'application/json', muteHttpExceptions: true,
@@ -102,7 +102,7 @@ function dispatch() {
 function watchdog_(runs) {
   const ok = runs.find((r) => r.conclusion === 'success');
   const age = ok ? minutesSince_(ok.updated_at) : Infinity;
-  const p = props();
+  const p = props_();
   const alertedAt = Number(p.getProperty('alerted_at') || 0);
   if (age >= STALE_MIN && runs.length) {
     if (Date.now() - alertedAt >= ALERT_EVERY_H * 3600e3) {
@@ -136,7 +136,7 @@ function tokenExpiry_(headers) {
   if (!raw) return;  // token without expiry
   const days = (parseExpiry_(raw) - Date.now()) / 86400e3;
   if (!(days < EXPIRY_WARN_D)) return;
-  const p = props();
+  const p = props_();
   if (Date.now() - Number(p.getProperty('expiry_warned_at') || 0) < 86400e3) return;
   tg_(`🔑 <b>jobradar</b>: токен GitHub у тригері Apps Script спливає через ${Math.max(0, Math.floor(days))} дн. (${raw}).\n` +
       'Створи новий (лише work-search, Actions: Read and write) і заміни GH_TOKEN у Script Properties.');
